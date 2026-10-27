@@ -3,6 +3,7 @@
 
 Usage:
     fetch_tasks.py <url-or-id> [<url-or-id> ...] [--json] [--tz Asia/Jakarta]
+                   [--with-subtasks] [--attachments-dir <dir>]
     echo "<url> <url>" | fetch_tasks.py
 
 Reads the personal API token from the CLICKUP_API_TOKEN environment variable.
@@ -34,6 +35,10 @@ TEAM_ENV = "CLICKUP_TEAM_ID"
 REQUEST_TIMEOUT_SECONDS = 20
 MAX_RETRY_WAIT_SECONDS = 60
 MAX_WORKERS = 5
+COMMENTS_PAGE_SIZE = 25
+MAX_COMMENT_PAGES = 40
+MAX_SUBTASK_DETAILS = 25
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -50,21 +55,32 @@ TOKEN_SETUP_MESSAGE = f"""\
 """
 
 CLICKUP_HOSTS = {"app.clickup.com", "clickup.com", "www.clickup.com"}
-RAW_TASK_ID = re.compile(r"^[0-9a-z]{4,20}$")
+# Native IDs always contain a digit, so plain words like "please" are not taken for IDs.
+RAW_TASK_ID = re.compile(r"^(?=[0-9a-z]*\d)[0-9a-z]{4,20}$")
+# "CU-86abc123" is how ClickUp's Git integrations write a native ID in branches and commits.
+CU_TASK_ID = re.compile(r"^cu-((?=[0-9a-z]*[a-z])(?=[0-9a-z]*\d)[0-9a-z]{4,20})$", re.IGNORECASE)
 RAW_CUSTOM_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 TEAM_ID = re.compile(r"^\d+$")
 
 # Work types in priority order: when several tags match, the first type wins.
 # Each tag is split into lowercase words and matched against these aliases.
 WORK_TYPE_ALIASES = (
+    ("security", {"security", "vulnerability", "vuln", "cve", "keamanan"}),
     ("bug", {"bug", "bugs", "bugfix", "fix", "hotfix", "defect", "error", "regression", "incident", "perbaikan"}),
     ("feature", {"feature", "features", "feat", "story", "fitur"}),
     ("enhancement", {"enhancement", "enhance", "improvement", "improve", "optimization", "optimize", "performance", "tweak", "peningkatan"}),
     ("refactor", {"refactor", "refactoring", "cleanup", "debt"}),
+    ("ui", {"ui", "ux", "design", "layout", "styling", "desain", "tampilan"}),
     ("research", {"research", "spike", "investigation", "investigate", "poc", "riset"}),
     ("docs", {"docs", "doc", "documentation", "dokumentasi"}),
+    ("test", {"test", "tests", "testing", "qa", "e2e", "coverage", "pengujian"}),
     ("chore", {"chore", "maintenance", "infra", "devops", "config", "deps", "dependencies", "upgrade"}),
 )
+INLINE_IMAGE = re.compile(r"!\[[^\]]*\]\((https://[^)\s]+)")
+# Only ClickUp's own hosts get attachment requests, and only they may see the token.
+ATTACHMENT_HOSTS = ("clickup-attachments.com", "clickup.com")
+# File types Claude can open with its Read tool.
+VIEWABLE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "pdf"}
 TITLE_LABEL = re.compile(r"^\s*(?:\[([^\]]+)\]|([A-Za-z][\w-]*)(?:\([^)]*\))?!?\s*:)")
 
 
@@ -117,9 +133,13 @@ def parse_reference(raw: str, default_team_id: Optional[str] = None) -> TaskRef:
         https://app.clickup.com/t/86abc123
         https://app.clickup.com/t/9012345678/PROJ-123   (custom task ID)
         86abc123                                         (bare task ID)
+        CU-86abc123                                      (task ID as written in branch names)
         PROJ-123                                         (bare custom ID, needs a team ID)
     """
     if "://" not in raw and "/" not in raw:
+        prefixed = CU_TASK_ID.match(raw)
+        if prefixed:
+            return TaskRef(raw, prefixed.group(1).lower())
         if RAW_CUSTOM_ID.match(raw):
             if not default_team_id:
                 raise InvalidReference(
@@ -206,11 +226,165 @@ def retry_delay(headers: Any) -> float:
     return 10.0
 
 
-def fetch_task(ref: TaskRef, token: str) -> Dict[str, Any]:
+def comment_date(comment: Dict[str, Any]) -> int:
+    try:
+        return int(comment.get("date") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def latest_comments(comments: List[Dict[str, Any]], max_comments: int) -> List[Dict[str, Any]]:
+    """Oldest first, keeping only the latest max_comments (-1 keeps all)."""
+    comments = sorted(comments, key=comment_date)
+    if max_comments >= 0:
+        return comments[-max_comments:] if max_comments else []
+    return comments
+
+
+def fetch_comments(task_id: str, token: str, max_comments: int) -> Tuple[List[Dict[str, Any]], bool]:
+    """ClickUp returns 25 comments per page, newest first; older pages need start and start_id.
+
+    Returns (comments, complete). complete is False when older comments were left unread.
+    """
+    path = f"/task/{urllib.parse.quote(task_id)}/comment"
+    comments: List[Dict[str, Any]] = []
+    seen = set()
+    query: Optional[Dict[str, str]] = None
+    for _ in range(MAX_COMMENT_PAGES):
+        page = api_get(path, token, query).get("comments", [])
+        fresh = [comment for comment in page if comment.get("id") not in seen]
+        seen.update(comment.get("id") for comment in fresh)
+        comments += fresh
+        if len(page) < COMMENTS_PAGE_SIZE or not fresh:
+            return comments, True
+        if 0 <= max_comments < len(comments):
+            return comments, False
+        oldest = min(page, key=comment_date)
+        query = {"start": str(oldest.get("date")), "start_id": str(oldest.get("id"))}
+    return comments, False
+
+
+def fetch_replies(comments: List[Dict[str, Any]], token: str) -> None:
+    """Attach the thread replies to every comment that has some."""
+    for comment in comments:
+        try:
+            has_replies = int(comment.get("reply_count") or 0) > 0
+        except (TypeError, ValueError):
+            has_replies = False
+        if has_replies and comment.get("id"):
+            path = f"/comment/{urllib.parse.quote(str(comment['id']))}/reply"
+            try:
+                comment["replies"] = api_get(path, token).get("comments", [])
+            except ApiError as error:
+                comment["replies_error"] = str(error)
+
+
+def fetch_task(ref: TaskRef, token: str, max_comments: int = 20, with_subtasks: bool = False) -> Dict[str, Any]:
     task_query = dict(ref.query(), include_subtasks="true", include_markdown_description="true")
     task = api_get(f"/task/{urllib.parse.quote(ref.task_id)}", token, task_query)
-    comments = api_get(f"/task/{urllib.parse.quote(task['id'])}/comment", token).get("comments", [])
-    return {"task": task, "comments": comments}
+    comments, complete = fetch_comments(task["id"], token, max_comments)
+    fetch_replies(latest_comments(comments, max_comments), token)
+    result = {"task": task, "comments": comments, "comments_complete": complete}
+    if with_subtasks:
+        result["subtask_details"] = fetch_subtask_details(task, token)
+    return result
+
+
+def fetch_subtask_details(task: Dict[str, Any], token: str) -> Dict[str, Dict[str, Any]]:
+    """Full payload of the first MAX_SUBTASK_DETAILS subtasks, keyed by ID."""
+    details = {}
+    for subtask in (task.get("subtasks") or [])[:MAX_SUBTASK_DETAILS]:
+        if subtask.get("id"):
+            query = {"include_markdown_description": "true"}
+            try:
+                details[subtask["id"]] = api_get(f"/task/{urllib.parse.quote(subtask['id'])}", token, query)
+            except ApiError as error:
+                details[subtask["id"]] = {"error": str(error)}
+    return details
+
+
+def is_attachment_host(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and any(host == name or host.endswith("." + name) for name in ATTACHMENT_HOSTS)
+
+
+class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward the token to wherever an attachment redirects (often a signed S3 URL)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is not None:
+            new_request.remove_header("Authorization")
+        return new_request
+
+
+ATTACHMENT_OPENER = urllib.request.build_opener(_DropAuthOnRedirect)
+
+
+def http_download(url: str, token: str) -> bytes:
+    """GET an attachment: first without the token, then with it if ClickUp asks for auth."""
+    for send_token in (False, True):
+        headers = {"User-Agent": "claude-clickup"}
+        if send_token:
+            headers["Authorization"] = token
+        try:
+            with ATTACHMENT_OPENER.open(urllib.request.Request(url, headers=headers), timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                data = response.read(MAX_ATTACHMENT_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403) and not send_token:
+                continue
+            raise ApiError(f"HTTP {error.code}") from None
+        except urllib.error.URLError as error:
+            raise ApiError(f"network error: {error.reason}") from None
+        except TimeoutError:
+            raise ApiError(f"timed out after {REQUEST_TIMEOUT_SECONDS}s") from None
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ApiError(f"larger than {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB")
+        return data
+    raise ApiError("download failed")
+
+
+def file_extension(*candidates: Optional[str]) -> str:
+    for candidate in candidates:
+        extension = os.path.splitext(candidate or "")[1].lstrip(".").lower()
+        if extension:
+            return extension
+    return ""
+
+
+def safe_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")[:80] or "file"
+
+
+def save_attachments(card: Dict[str, Any], token: str, directory: str) -> None:
+    """Download the images and PDFs of a card so Claude can open them; mark the rest as skipped."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        pass  # open() below reports the problem per attachment
+    for index, attachment in enumerate(card["attachments"], 1):
+        url = attachment.get("url") or ""
+        extension = file_extension(attachment.get("name"), urllib.parse.urlparse(url).path)
+        if extension not in VIEWABLE_EXTENSIONS:
+            attachment["skipped"] = "not an image or PDF"
+            continue
+        if not is_attachment_host(url):
+            attachment["skipped"] = "not hosted by ClickUp"
+            continue
+        name = safe_filename(os.path.splitext(attachment.get("name") or "")[0])
+        path = os.path.join(directory, f"{safe_filename(card['id'] or 'task')}-{index}-{name}.{extension}")
+        try:
+            data = http_download(url, token)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except ApiError as error:
+            attachment["skipped"] = str(error)
+            continue
+        except OSError as error:
+            attachment["skipped"] = f"could not save: {error.strerror or error}"
+            continue
+        attachment["path"] = os.path.abspath(path)
 
 
 def resolve_timezone(name: Optional[str]) -> Optional[tzinfo]:
@@ -278,6 +452,127 @@ def classify_work_type(tags: List[str], name: Optional[str]) -> Tuple[Optional[s
     return None, None
 
 
+def format_duration(milliseconds: Any) -> Optional[str]:
+    try:
+        minutes = int(milliseconds) // 60000
+    except (TypeError, ValueError):
+        return None
+    if minutes <= 0:
+        return None
+    hours, minutes = divmod(minutes, 60)
+    return " ".join(part for part in (f"{hours}h" if hours else "", f"{minutes}m" if minutes else "") if part)
+
+
+def custom_field_value(field: Dict[str, Any], tz: Optional[tzinfo]) -> Optional[str]:
+    """Render a custom field value as text, or None when it is empty."""
+    value = field.get("value")
+    if value in (None, "", [], {}):
+        return None
+    kind = field.get("type")
+    options = (field.get("type_config") or {}).get("options") or []
+    if kind == "drop_down":
+        for index, option in enumerate(options):
+            if str(value) in (str(option.get("orderindex", index)), str(option.get("id"))):
+                return option.get("name") or str(value)
+        return str(value)
+    if kind == "labels" and isinstance(value, list):
+        labels = {option.get("id"): option.get("label") or option.get("name") for option in options}
+        return ", ".join(str(labels.get(item) or item) for item in value)
+    if kind == "date":
+        return format_timestamp(value, tz)
+    if kind == "checkbox":
+        return "yes" if value in (True, "true") else None
+    if kind == "users" and isinstance(value, list):
+        return ", ".join(user_name(user) for user in value) or None
+    if kind == "tasks" and isinstance(value, list):
+        return ", ".join(str(item.get("name") or item.get("id")) for item in value if isinstance(item, dict)) or None
+    if isinstance(value, dict):
+        if "formatted_address" in value:
+            return value.get("formatted_address")
+        if "percent_completed" in value:
+            return f"{value.get('percent_completed')}%"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def task_relations(task: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Parent, dependencies and linked tasks as (relation, task ID) pairs."""
+    own_id = task.get("id")
+    relations = []
+    if task.get("parent"):
+        relations.append({"relation": "Parent", "id": task["parent"]})
+    for dependency in task.get("dependencies") or []:
+        if dependency.get("task_id") == own_id and dependency.get("depends_on"):
+            relations.append({"relation": "Waiting on", "id": dependency["depends_on"]})
+        elif dependency.get("depends_on") == own_id and dependency.get("task_id"):
+            relations.append({"relation": "Blocking", "id": dependency["task_id"]})
+    for link in task.get("linked_tasks") or []:
+        other = link.get("link_id") if link.get("task_id") == own_id else link.get("task_id")
+        if other:
+            relations.append({"relation": "Linked", "id": other})
+    return relations
+
+
+def simplify_checklists(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": checklist.get("name"),
+            "items": [
+                {"name": item.get("name"), "done": bool(item.get("resolved"))}
+                for item in checklist.get("items") or []
+            ],
+        }
+        for checklist in task.get("checklists") or []
+    ]
+
+
+def task_description(task: Dict[str, Any]) -> str:
+    return (task.get("markdown_description") or task.get("text_content") or "").strip()
+
+
+def simplify_attachments(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Attachments of the task plus images embedded in its description, without duplicates."""
+    attachments = []
+    seen = set()
+    for attachment in task.get("attachments") or []:
+        url = attachment.get("url")
+        name = attachment.get("title") or (os.path.basename(urllib.parse.urlparse(url).path) if url else None)
+        if not name and not url:
+            continue
+        attachments.append({"name": name or url, "url": url})
+        seen.add(url)
+    for url in INLINE_IMAGE.findall(task_description(task)):
+        if url not in seen:
+            seen.add(url)
+            attachments.append({"name": os.path.basename(urllib.parse.urlparse(url).path) or url, "url": url})
+    return attachments
+
+
+def simplify_comment(comment: Dict[str, Any], tz: Optional[tzinfo]) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "author": user_name(comment.get("user")),
+        "date": format_timestamp(comment.get("date"), tz),
+        "text": (comment.get("comment_text") or "").strip(),
+    }
+    if comment.get("replies"):
+        entry["replies"] = [simplify_comment(reply, tz) for reply in sorted(comment["replies"], key=comment_date)]
+    if comment.get("replies_error"):
+        entry["replies_error"] = comment["replies_error"]
+    return entry
+
+
+def simplify_subtask(subtask: Dict[str, Any], detail: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {"id": subtask.get("id"), "name": subtask.get("name"), "status": nested_name(subtask.get("status"))}
+    if detail is not None:
+        if "error" in detail:
+            entry["error"] = detail["error"]
+        else:
+            entry["description"] = task_description(detail)
+            entry["checklists"] = simplify_checklists(detail)
+    return entry
+
+
 def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) -> Dict[str, Any]:
     """Reduce the raw API payload to the fields that matter when reading a card."""
     task = result["task"]
@@ -291,12 +586,18 @@ def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) ->
         if part
     ]
 
-    comments = sorted(result.get("comments", []), key=lambda comment: int(comment.get("date") or 0))
-    if max_comments >= 0:
-        comments = comments[-max_comments:] if max_comments else []
+    comments = latest_comments(result.get("comments", []), max_comments)
 
     tags = [tag.get("name") for tag in task.get("tags") or [] if tag.get("name")]
     work_type, work_type_source = classify_work_type(tags, task.get("name"))
+
+    fields = []
+    for field in task.get("custom_fields") or []:
+        value = custom_field_value(field, tz)
+        if value and field.get("name"):
+            fields.append({"name": field["name"], "value": value})
+
+    subtask_details = result.get("subtask_details")
 
     return {
         "id": task.get("id"),
@@ -315,35 +616,45 @@ def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) ->
         "due_date": format_timestamp(task.get("due_date"), tz),
         "created": format_timestamp(task.get("date_created"), tz),
         "updated": format_timestamp(task.get("date_updated"), tz),
-        "description": (task.get("markdown_description") or task.get("text_content") or "").strip(),
-        "checklists": [
-            {
-                "name": checklist.get("name"),
-                "items": [
-                    {"name": item.get("name"), "done": bool(item.get("resolved"))}
-                    for item in checklist.get("items") or []
-                ],
-            }
-            for checklist in task.get("checklists") or []
-        ],
+        "points": task.get("points"),
+        "time_estimate": format_duration(task.get("time_estimate")),
+        "time_spent": format_duration(task.get("time_spent")),
+        "fields": fields,
+        "relations": task_relations(task),
+        "description": task_description(task),
+        "checklists": simplify_checklists(task),
         "subtasks": [
-            {"id": subtask.get("id"), "name": subtask.get("name"), "status": nested_name(subtask.get("status"))}
+            simplify_subtask(subtask, None if subtask_details is None else subtask_details.get(subtask.get("id"), None))
             for subtask in task.get("subtasks") or []
         ],
-        "attachments": [
-            attachment.get("title") or attachment.get("url")
-            for attachment in task.get("attachments") or []
-        ],
-        "comments": [
-            {
-                "author": user_name(comment.get("user")),
-                "date": format_timestamp(comment.get("date"), tz),
-                "text": (comment.get("comment_text") or "").strip(),
-            }
-            for comment in comments
-        ],
+        "attachments": simplify_attachments(task),
+        "comments": [simplify_comment(comment, tz) for comment in comments],
         "comment_count": len(result.get("comments", [])),
+        "comments_complete": result.get("comments_complete", True),
     }
+
+
+def format_checklists(checklists: List[Dict[str, Any]]) -> List[str]:
+    lines = []
+    for checklist in checklists:
+        lines += ["", f"**{checklist['name']}**"]
+        lines += [f"- [{'x' if item['done'] else ' '}] {item['name']}" for item in checklist["items"]]
+    return lines
+
+
+def format_comment(comment: Dict[str, Any], prefix: str = "") -> List[str]:
+    header = f"**{comment['author']}** · {comment['date'] or ''}".rstrip(" ·")
+    lines = [header] + (comment["text"] or "_(empty)_").splitlines()
+    lines = [f"{prefix}{line}".rstrip() for line in lines]
+    for reply in comment.get("replies", []):
+        lines += [f"{prefix}>"] + format_comment(reply, prefix + "> ")
+    if comment.get("replies_error"):
+        lines.append(f"{prefix}> _Replies not loaded: {comment['replies_error']}_")
+    return lines
+
+
+def task_link(task_id: str) -> str:
+    return f"https://app.clickup.com/t/{task_id}"
 
 
 def format_markdown(card: Dict[str, Any]) -> str:
@@ -365,33 +676,60 @@ def format_markdown(card: Dict[str, Any]) -> str:
         ("Due", card.get("due_date")),
         ("Created", card.get("created")),
         ("Updated", card.get("updated")),
+        ("Points", card.get("points")),
+        ("Estimate", card.get("time_estimate")),
+        ("Time spent", card.get("time_spent")),
     ]
-    lines += [f"- **{label}:** {value}" for label, value in facts if value]
+    lines += [f"- **{label}:** {value}" for label, value in facts if value not in (None, "")]
+
+    if card.get("fields"):
+        lines += ["", "### Fields", ""]
+        lines += [f"- **{field['name']}:** {field['value']}" for field in card["fields"]]
+
+    if card.get("relations"):
+        lines += ["", "### Relations", ""]
+        lines += [f"- {relation['relation']}: {task_link(relation['id'])}" for relation in card["relations"]]
 
     lines += ["", "### Description", "", card["description"] or "_No description._"]
 
     if card["checklists"]:
         lines += ["", "### Checklists"]
-        for checklist in card["checklists"]:
-            lines += ["", f"**{checklist['name']}**"]
-            lines += [f"- [{'x' if item['done'] else ' '}] {item['name']}" for item in checklist["items"]]
+        lines += format_checklists(card["checklists"])
 
     if card["subtasks"]:
-        lines += ["", "### Subtasks", ""]
-        lines += [f"- {subtask['name']} ({subtask['status']}) `{subtask['id']}`" for subtask in card["subtasks"]]
+        lines += ["", "### Subtasks"]
+        brief = []
+        for subtask in card["subtasks"]:
+            label = f"{subtask['name']} ({subtask['status']}) `{subtask['id']}`"
+            if "error" in subtask:
+                lines += ["", f"#### {label}", "", f"_Not loaded: {subtask['error']}_"]
+            elif "description" in subtask:
+                lines += ["", f"#### {label}", "", subtask["description"] or "_No description._"]
+                lines += format_checklists(subtask["checklists"])
+            else:
+                brief.append(f"- {label}")
+        if brief:
+            lines += [""] + brief
 
     if card["attachments"]:
         lines += ["", "### Attachments", ""]
-        lines += [f"- {attachment}" for attachment in card["attachments"]]
+        for attachment in card["attachments"]:
+            line = f"- {attachment['name']}"
+            if attachment.get("path"):
+                line += f" → saved to `{attachment['path']}`"
+            elif attachment.get("skipped"):
+                line += f" (not downloaded: {attachment['skipped']})"
+            lines.append(line)
 
     shown = len(card["comments"])
+    total = f"{card['comment_count']}" + ("" if card.get("comments_complete", True) else "+")
     heading = "### Comments"
-    if card["comment_count"] > shown:
-        heading += f" (latest {shown} of {card['comment_count']})"
+    if card["comment_count"] > shown or not card.get("comments_complete", True):
+        heading += f" (latest {shown} of {total})"
     if card["comment_count"]:
         lines += ["", heading]
         for comment in card["comments"]:
-            lines += ["", f"**{comment['author']}** · {comment['date'] or ''}".rstrip(" ·"), comment["text"] or "_(empty)_"]
+            lines += [""] + format_comment(comment)
 
     return "\n".join(lines)
 
@@ -407,6 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tz", help="IANA time zone for dates, e.g. Asia/Jakarta (default: local time)")
     parser.add_argument("--team-id", default=os.environ.get(TEAM_ENV), help=f"team (workspace) ID for bare custom IDs (default: ${TEAM_ENV})")
     parser.add_argument("--max-comments", type=int, default=20, help="latest comments to show per task, -1 for all (default: 20)")
+    parser.add_argument("--with-subtasks", action="store_true", help=f"also load the description and checklists of up to {MAX_SUBTASK_DETAILS} subtasks per task")
+    parser.add_argument("--attachments-dir", help="download image and PDF attachments (also images in the description) into this folder")
     return parser
 
 
@@ -447,9 +787,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if ref is None:
             return {"input": raw, "error": error}
         try:
-            return {"input": raw, "card": simplify(fetch_task(ref, token), tz, args.max_comments)}
+            card = simplify(fetch_task(ref, token, args.max_comments, args.with_subtasks), tz, args.max_comments)
         except ApiError as api_error:
             return {"input": raw, "error": str(api_error)}
+        if args.attachments_dir:
+            save_attachments(card, token, args.attachments_dir)
+        return {"input": raw, "card": card}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         results = list(pool.map(load, refs))

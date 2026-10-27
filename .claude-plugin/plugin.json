@@ -1,7 +1,7 @@
 {
   "name": "clickup",
-  "version": "0.2.0",
-  "description": "Read ClickUp tasks from their links and plan the work: paste one or many card links and Claude fetches title, status, description, checklists, subtasks and comments through the ClickUp API, then builds a plan shaped by the card type (bug, feature, enhancement, ...).",
+  "version": "0.3.0",
+  "description": "Read ClickUp tasks from their links and plan the work: paste one or many card links and Claude fetches title, status, description, checklists, subtasks and comments through the ClickUp API, then builds a plan shaped by the card type (bug, feature, enhancement, ...), lists your open tasks, and drafts branch, commit and PR text. Never commits or pushes.",
   "author": {
     "name": "Faisal Fidiyatulloh",
     "url": "https://github.com/isajagapapa"
