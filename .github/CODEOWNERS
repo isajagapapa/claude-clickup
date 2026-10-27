@@ -1,0 +1,3 @@
+# Default owner for everything in the repository.
+# Must match the author url in .claude-plugin/plugin.json.
+* @isajagapapa

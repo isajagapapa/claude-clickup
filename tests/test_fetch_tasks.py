@@ -186,6 +186,15 @@ class SkillRulesTest(unittest.TestCase):
                 self.assertIn("Read-only", text)
 
 
+class CodeOwnersTest(unittest.TestCase):
+    def test_default_owner_is_plugin_author(self):
+        repo = SCRIPT.parents[3]
+        manifest = json.loads((repo / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        owner = "@" + manifest["author"]["url"].rstrip("/").rsplit("/", 1)[-1]
+        rules = [line.split() for line in (repo / ".github" / "CODEOWNERS").read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
+        self.assertIn(["*", owner], rules)
+
+
 class FormatTest(unittest.TestCase):
     def setUp(self):
         self.card = fetch_tasks.simplify({"task": TASK, "comments": COMMENTS}, timezone.utc, 20)
