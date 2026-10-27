@@ -2,7 +2,7 @@
 
 [English](README.md) · **Bahasa Indonesia**
 
-Skill [Claude Code](https://claude.com/claude-code) untuk membaca task ClickUp dari link-nya. Tempel satu atau banyak link card, lalu Claude mengambil detailnya lewat ClickUp API, merangkumnya, dan membuat rencana kerja sesuai tipe card (bug, feature, enhancement, ...) di project yang sedang Anda kerjakan.
+Skill [Claude Code](https://claude.com/claude-code) untuk membaca task ClickUp dari link-nya. Tempel satu atau banyak link card, lalu Claude mengambil detailnya lewat ClickUp API, merangkumnya, membuat rencana kerja sesuai tipe card (bug, feature, enhancement, ...) di project yang sedang Anda kerjakan, menampilkan task Anda yang masih terbuka, dan menyusun nama branch, pesan commit serta deskripsi PR untuk sebuah card.
 
 Link ClickUp butuh login, jadi Claude tidak bisa membukanya dengan mengambil halaman web biasa. Karena itu skill ini memakai personal API token Anda.
 
@@ -10,11 +10,16 @@ Link ClickUp butuh login, jadi Claude tidak bisa membukanya dengan mengambil hal
 
 - Baca banyak link sekaligus, diambil paralel
 - Judul, status, prioritas, assignee, tanggal mulai/tenggat, tag, folder dan list
-- Deskripsi (Markdown), checklist, subtask, nama lampiran, komentar terbaru
-- Task ID biasa dan custom task ID (`PROJ-123`)
-- Mengenali tipe card dari tag atau prefix judul (bug, feature, enhancement, refactor, research, docs, chore)
+- Deskripsi (Markdown), checklist, subtask (opsional beserta deskripsi dan checklist-nya), komentar beserta balasan di thread-nya
+- Custom field (story point, severity, sprint, ...), point, estimasi waktu dan waktu yang terpakai
+- Relasi: parent task, menunggu (waiting on), memblokir (blocking), task yang ditautkan
+- Mengunduh screenshot, mockup dan PDF (lampiran dan gambar di deskripsi) supaya Claude bisa melihatnya
+- Task ID biasa, custom task ID (`PROJ-123`) dan `CU-86abc123` seperti di nama branch
+- Mengenali tipe card dari tag atau prefix judul (security, bug, feature, enhancement, refactor, ui, research, docs, test, chore)
 - Skill `plan`: rencana kerja per card sesuai tipenya; di plan mode hanya membuat rencana, di mode lain membuat rencana lalu langsung mengeksekusi
-- Read-only: tidak pernah mengubah apa pun di ClickUp
+- Skill `mine`: task Anda yang masih terbuka, atau task di sebuah list, diurutkan per tenggat dengan saran untuk hari ini
+- Skill `pr`: nama branch, pesan commit dan deskripsi PR dari card dan perubahan Anda
+- Read-only: tidak pernah mengubah apa pun di ClickUp, dan tidak pernah commit atau push apa pun di repository Anda
 - Hanya pakai standard library Python, tidak perlu install package
 
 ## Persyaratan
@@ -74,11 +79,13 @@ Untuk update nanti: `/plugin marketplace update claude-clickup`.
 git clone https://github.com/isajagapapa/claude-clickup.git
 mkdir -p ~/.claude/skills
 cp -R claude-clickup/skills/clickup ~/.claude/skills/clickup
-cp -R claude-clickup/skills/plan ~/.claude/skills/clickup-plan
-sed -i.bak 's/^name: plan$/name: clickup-plan/' ~/.claude/skills/clickup-plan/SKILL.md && rm ~/.claude/skills/clickup-plan/SKILL.md.bak
+for skill in plan mine pr; do
+  cp -R "claude-clickup/skills/$skill" ~/.claude/skills/clickup-$skill
+  sed -i.bak "s/^name: $skill\$/name: clickup-$skill/" ~/.claude/skills/clickup-$skill/SKILL.md && rm ~/.claude/skills/clickup-$skill/SKILL.md.bak
+done
 ```
 
-Skill `plan` di-copy sebagai `clickup-plan` karena Claude Code sudah punya perintah bawaan `/plan`. Letakkan kedua folder bersebelahan: `clickup-plan` menjalankan script yang ada di `clickup`.
+Skill `plan`, `mine` dan `pr` di-copy dengan prefix `clickup-` karena Claude Code sudah punya perintah bawaan `/plan`. Letakkan semua folder bersebelahan: skill-skill itu menjalankan script yang ada di `clickup`.
 
 Kalau hanya ingin dipakai di satu project, copy ke `<project>/.claude/skills/`.
 
@@ -88,6 +95,10 @@ Kalau hanya ingin dipakai di satu project, copy ke `<project>/.claude/skills/`.
 |---|---|---|---|
 | `clickup` | `/clickup:clickup <link>` | `/clickup <link>` | Membaca card lalu merangkumnya |
 | `plan` | `/clickup:plan <link>` | `/clickup-plan <link>` | Membuat rencana kerja sesuai tipe card, lalu mengeksekusi kalau bukan plan mode |
+| `mine` | `/clickup:mine [<link list>]` | `/clickup-mine` | Menampilkan task Anda yang masih terbuka (atau task sebuah list) dan menyarankan yang dikerjakan hari ini |
+| `pr` | `/clickup:pr [<link>]` | `/clickup-pr` | Mengusulkan nama branch, pesan commit dan deskripsi PR untuk sebuah card |
+
+Tidak ada skill yang menjalankan `git commit`, `git push` atau membuka pull request: semua operasi tulis git diserahkan ke Anda.
 
 ### `clickup`: baca card
 
@@ -114,7 +125,7 @@ https://app.clickup.com/t/86abc123
 https://app.clickup.com/t/86def456
 ```
 
-Claude membalas dengan ringkasan per card (tujuan, acceptance criteria, keputusan dari komentar, pertanyaan terbuka), ditambah tabel ringkas (card, tipe, status, assignee, tenggat) kalau card-nya lebih dari satu.
+Claude membalas dengan ringkasan per card (tujuan, acceptance criteria, keputusan dari komentar, pertanyaan terbuka), ditambah tabel ringkas (card, tipe, status, assignee, tenggat) kalau card-nya lebih dari satu. Screenshot dan mockup di card diunduh ke folder sementara supaya Claude juga bisa melihatnya.
 
 ### `plan`: rencanakan pekerjaan
 
@@ -127,14 +138,15 @@ Meminta lewat pesan biasa ("buatkan plan untuk card ini", "perbaiki card ini") j
 1. membaca card dan menentukan tipenya dari tag (kalau tidak ada, dari prefix judul seperti `[Bug]` atau `fix:`, lalu dari penilaiannya sendiri yang ditulis sebagai asumsi),
 2. menjelajahi project Anda supaya rencana menyebut file dan test yang nyata,
 3. menulis rencana dari template tipe tersebut, ditambah pertanyaan terbuka untuk pemilik card,
-4. menampilkannya di chat, dan juga menyimpannya ke lokasi plan yang diatur CLAUDE.md project Anda (kalau ada aturannya).
+4. memetakan setiap acceptance criteria ke test yang membuktikannya,
+5. menampilkannya di chat, dan juga menyimpannya ke lokasi plan yang diatur CLAUDE.md project Anda (kalau tidak ada aturannya, Claude menawarkan menyimpan ke `.claude/plans/`).
 
 Langkah berikutnya tergantung mode Claude Code:
 
 | Mode | Perilaku |
 |---|---|
 | Plan mode (Shift+Tab) | Hanya membuat rencana. Claude berhenti di persetujuan plan dan menunggu instruksi Anda. |
-| Mode lain | Membuat rencana, memberi peringatan "⚡ Not in plan mode: executing this plan now", lalu langsung mengeksekusi. Tekan Esc untuk berhenti. |
+| Mode lain | Membuat rencana, memberi peringatan "⚡ Not in plan mode: executing this plan now", lalu langsung mengeksekusi. Tekan Esc untuk berhenti. Perubahan dibiarkan belum di-commit supaya bisa Anda review. |
 
 Aturan kerja untuk setiap card:
 
@@ -148,15 +160,41 @@ Tipe card dan tag yang dipetakan ke sana (dicocokkan per kata, tidak peka huruf 
 
 | Tipe | Tag | Fokus rencana |
 |---|---|---|
+| `security` | security, vulnerability, vuln, cve, keamanan | ancaman, attack surface, test exploit dulu, fix di akar masalah, eksposur |
 | `bug` | bug, bugfix, fix, hotfix, defect, error, regression, incident, perbaikan | reproduce, root cause, test gagal dulu, fix minimal, rollback |
 | `feature` | feature, feat, story, fitur | scope dan acceptance criteria, desain, tahapan, rollout |
 | `enhancement` | enhancement, enhance, improvement, improve, optimization, performance, tweak, peningkatan | kondisi sekarang vs yang diinginkan, kompatibilitas, cara mengukur |
 | `refactor` | refactor, cleanup, tech-debt | perilaku tidak berubah, test pengaman, langkah kecil yang tetap hijau |
+| `ui` | ui, ux, design, layout, styling, desain, tampilan | kondisi sekarang vs mockup, komponen yang dipakai ulang, state, responsif dan aksesibel |
 | `research` | research, spike, investigation, poc, riset | pertanyaan, opsi, timebox, rekomendasi |
 | `docs` | docs, documentation, dokumentasi | pembaca, file, keakuratan contoh |
+| `test` | test, testing, qa, e2e, coverage, pengujian | kasus, pendekatan, penyebab flaky, test yang benar-benar bisa gagal |
 | `chore` | chore, maintenance, infra, devops, config, deps, upgrade | perubahan, dampak, rollback |
 
 Template-nya ada di [`skills/plan/references/`](skills/plan/references/).
+
+### `mine`: task Anda yang masih terbuka
+
+```
+/clickup:mine
+/clickup:mine https://app.clickup.com/9012345678/v/li/901234567890
+```
+
+Bertanya "task ClickUp saya apa saja?" atau "hari ini sebaiknya kerjakan apa?" juga memicunya. Tanpa link, Claude menampilkan task terbuka yang di-assign ke Anda; dengan link list atau board, Claude menampilkan task terbuka di sana. Hasilnya dikelompokkan menjadi lewat tenggat, segera jatuh tempo dan sisanya, ditambah maksimal tiga saran untuk hari ini. Kalau punya beberapa workspace, set `CLICKUP_TEAM_ID` (atau Claude akan menanyakan yang mana).
+
+### `pr`: teks branch, commit dan PR
+
+```
+/clickup:pr https://app.clickup.com/t/86abc123
+```
+
+Tanpa link, Claude mencari `CU-<id>` atau custom ID di nama branch saat ini. Claude membaca card dan perubahan Anda dengan perintah git yang read-only (`git status`, `git diff`, `git log`) lalu mengusulkan:
+
+- nama branch seperti `feat/CU-86abc123-donation-email`, yang ditautkan ke card oleh integrasi GitHub, GitLab dan Bitbucket milik ClickUp,
+- pesan commit sesuai gaya project Anda (default Conventional Commits),
+- judul dan deskripsi PR dengan acceptance criteria card yang dicentang hanya jika diff Anda memang mencakupnya.
+
+Perintah git-nya Anda copy dan jalankan sendiri; skill ini tidak pernah commit, push atau membuka PR.
 
 ### Format link yang didukung
 
@@ -165,24 +203,39 @@ Template-nya ada di [`skills/plan/references/`](skills/plan/references/).
 | Link task | `https://app.clickup.com/t/86abc123` |
 | Link custom task ID | `https://app.clickup.com/t/9012345678/PROJ-42` |
 | Task ID saja | `86abc123` |
+| Task ID seperti di nama branch | `CU-86abc123` |
 | Custom ID saja | `PROJ-42` (perlu `CLICKUP_TEAM_ID` berisi ID workspace Anda) |
 
-Link list, board dan doc (`/v/li/...`, `/v/b/...`, `/v/dc/...`) bukan task. Buka task-nya lalu pakai **Copy link**.
+Link list dan board (`/v/li/...`, `/v/b/...`) bukan task: pakai dengan skill `mine`. Link doc (`/v/dc/...`) tidak didukung. Untuk satu task, buka task-nya lalu pakai **Copy link**.
 
 ### Jalankan script langsung
 
-Skill ini memanggil script kecil yang juga bisa Anda jalankan sendiri:
+Skill-skill ini memanggil dua script kecil yang juga bisa Anda jalankan sendiri:
 
 ```bash
 python3 skills/clickup/scripts/fetch_tasks.py https://app.clickup.com/t/86abc123 --tz Asia/Jakarta
+python3 skills/clickup/scripts/list_tasks.py
 ```
+
+`fetch_tasks.py` membaca card:
 
 | Opsi | Arti |
 |---|---|
 | `--tz <zona>` | Zona waktu IANA untuk tanggal, mis. `Asia/Jakarta` (default: waktu lokal) |
 | `--max-comments <n>` | Jumlah komentar terbaru per task, `-1` untuk semua (default: 20) |
+| `--with-subtasks` | Ikut memuat deskripsi dan checklist maksimal 25 subtask |
+| `--attachments-dir <dir>` | Mengunduh lampiran gambar dan PDF (juga gambar di deskripsi) ke folder itu, maksimal 10 MB per file |
 | `--team-id <id>` | ID workspace untuk custom ID tanpa link (default: `$CLICKUP_TEAM_ID`) |
 | `--json` | Output JSON terstruktur, bukan Markdown |
+
+`list_tasks.py` menampilkan task terbuka yang di-assign ke Anda, atau task dari link list dan view yang Anda berikan:
+
+| Opsi | Arti |
+|---|---|
+| `--team-id <id>` | Workspace untuk task Anda (default: `$CLICKUP_TEAM_ID`, atau satu-satunya workspace Anda) |
+| `--include-closed` | Ikut menampilkan task yang sudah closed |
+| `--limit <n>` | Jumlah maksimal task per sumber (default: 100) |
+| `--tz <zona>`, `--json` | Sama seperti di atas |
 
 Exit code: `0` semua berhasil, `1` ada yang gagal, `2` salah pemakaian, `3` token belum diset.
 
@@ -193,21 +246,24 @@ Exit code: `0` semua berhasil, `1` ada yang gagal, `2` salah pemakaian, `3` toke
 | `CLICKUP_API_TOKEN is not set` | Set variabelnya (langkah 2), lalu restart Claude Code dan editor sepenuhnya. |
 | `HTTP 401: token is invalid or expired` | Generate token baru di ClickUp lalu perbarui variabelnya. |
 | `HTTP 403` / `HTTP 404` | Pemilik token tidak punya akses ke task itu, task sudah dihapus, atau custom ID milik workspace lain. |
-| `unsupported ClickUp link` | Itu link list/board/doc. Copy link task-nya sendiri. |
+| `unsupported ClickUp link` | Itu link list/board/doc. Copy link task-nya sendiri, atau pakai `mine` untuk list dan board. |
+| `pick a workspace with --team-id` | Token Anda melihat beberapa workspace. Set `CLICKUP_TEAM_ID` ke workspace yang diinginkan. |
 | `python3: command not found` di Windows | Install Python dari python.org, atau pakai `python` / `py`. Claude otomatis mencoba keduanya. |
 | `unknown time zone` di Windows | Jalankan `pip install tzdata`, atau jangan pakai `--tz`. |
 
 ## Keamanan
 
 - Token hanya dibaca dari environment variable `CLICKUP_API_TOKEN` dan tidak pernah ditampilkan.
-- Skill ini hanya mengirim request `GET` ke `api.clickup.com`. Tidak bisa membuat, mengubah atau menghapus apa pun.
+- Skill-skill ini hanya mengirim request `GET` ke `api.clickup.com`, ditambah request `GET` ke host lampiran ClickUp saat mengunduh lampiran. Tidak bisa membuat, mengubah atau menghapus apa pun di ClickUp.
+- Token baru dikirim ke host lampiran setelah host itu membalas 401/403, dan tidak pernah diteruskan saat redirect.
+- Skill-skill ini tidak pernah menjalankan `git commit`, `git push`, `git tag`, `git merge` atau `git rebase`, dan tidak pernah membuat branch atau pull request.
 - Isi card diperlakukan sebagai data, bukan instruksi untuk Claude.
 - Siapa pun yang memegang token Anda punya akses ClickUp Anda. Kalau bocor, segera generate ulang di ClickUp.
 
 ## Uninstall
 
 - Plugin: `/plugin uninstall clickup@claude-clickup`, lalu `/plugin marketplace remove claude-clickup`
-- Manual: `rm -rf ~/.claude/skills/clickup ~/.claude/skills/clickup-plan`
+- Manual: `rm -rf ~/.claude/skills/clickup ~/.claude/skills/clickup-plan ~/.claude/skills/clickup-mine ~/.claude/skills/clickup-pr`
 
 ## Kontribusi
 
