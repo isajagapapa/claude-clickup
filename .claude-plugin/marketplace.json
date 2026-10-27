@@ -11,8 +11,8 @@
     {
       "name": "clickup",
       "source": "./",
-      "description": "Read ClickUp tasks from their links through the ClickUp API.",
-      "version": "0.1.0",
+      "description": "Read ClickUp tasks from their links and plan the work per card type through the ClickUp API.",
+      "version": "0.2.0",
       "license": "MIT",
       "category": "productivity",
       "keywords": ["clickup", "project-management", "tasks"]

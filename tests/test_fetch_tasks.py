@@ -108,6 +108,50 @@ class SplitInputsTest(unittest.TestCase):
         )
 
 
+class ClassifyWorkTypeTest(unittest.TestCase):
+    def test_from_tags(self):
+        cases = {
+            "Bug": "bug",
+            "tech-debt": "refactor",
+            "new feature": "feature",
+            "Enhancement": "enhancement",
+            "spike": "research",
+            "documentation": "docs",
+            "maintenance": "chore",
+        }
+        for tag, expected in cases.items():
+            with self.subTest(tag=tag):
+                self.assertEqual(fetch_tasks.classify_work_type([tag], "Some card"), (expected, f"tag: {tag}"))
+
+    def test_priority_when_many_tags_match(self):
+        self.assertEqual(fetch_tasks.classify_work_type(["enhancement", "backend", "bug"], None), ("bug", "tag: bug"))
+
+    def test_from_title_prefix(self):
+        self.assertEqual(fetch_tasks.classify_work_type([], "[Enhancement] Faster search"), ("enhancement", "title prefix"))
+        self.assertEqual(fetch_tasks.classify_work_type(["backend"], "fix(auth): login loop"), ("bug", "title prefix"))
+
+    def test_no_match(self):
+        self.assertEqual(fetch_tasks.classify_work_type(["backend"], "Donation email: send after verify"), (None, None))
+        self.assertEqual(fetch_tasks.classify_work_type([], None), (None, None))
+
+
+class PlanReferencesTest(unittest.TestCase):
+    def test_every_work_type_has_a_plan_template(self):
+        references = SCRIPT.parents[2] / "plan" / "references"
+        work_types = [work_type for work_type, _ in fetch_tasks.WORK_TYPE_ALIASES] + ["general"]
+        for work_type in work_types:
+            with self.subTest(work_type=work_type):
+                self.assertTrue((references / f"{work_type}.md").is_file())
+
+
+class PlanSkillTest(unittest.TestCase):
+    def test_working_rules_present(self):
+        skill = (SCRIPT.parents[2] / "plan" / "SKILL.md").read_text(encoding="utf-8")
+        for rule in ("Working rules", "Senior developer review", "Best practice", "Scope", "Out of scope", "Recommendations", "Self-fixing"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, skill)
+
+
 class FormatTest(unittest.TestCase):
     def setUp(self):
         self.card = fetch_tasks.simplify({"task": TASK, "comments": COMMENTS}, timezone.utc, 20)
@@ -139,6 +183,14 @@ class FormatTest(unittest.TestCase):
         self.assertIn("- Mail template (to do) `86sub1`", markdown)
         self.assertIn("mockup.png", markdown)
         self.assertIn("Use the WIB timezone.", markdown)
+        self.assertNotIn("**Type:**", markdown)
+
+    def test_work_type(self):
+        self.assertIsNone(self.card["work_type"])
+        task = dict(TASK, tags=[{"name": "backend"}, {"name": "Bug"}])
+        card = fetch_tasks.simplify({"task": task, "comments": []}, None, 20)
+        self.assertEqual((card["work_type"], card["work_type_source"]), ("bug", "tag: Bug"))
+        self.assertIn("- **Type:** bug (tag: Bug)", fetch_tasks.format_markdown(card))
 
     def test_empty_description_placeholder(self):
         task = dict(TASK, markdown_description="", text_content="")
@@ -182,6 +234,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, fetch_tasks.EXIT_OK)
         payload = json.loads(stdout)
         self.assertEqual(payload[0]["card"]["name"], "Donation notification email")
+        self.assertIn("work_type", payload[0]["card"])
 
     def test_sends_custom_id_query(self):
         api = mock.Mock(side_effect=fake_api)

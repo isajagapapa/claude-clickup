@@ -54,6 +54,19 @@ RAW_TASK_ID = re.compile(r"^[0-9a-z]{4,20}$")
 RAW_CUSTOM_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 TEAM_ID = re.compile(r"^\d+$")
 
+# Work types in priority order: when several tags match, the first type wins.
+# Each tag is split into lowercase words and matched against these aliases.
+WORK_TYPE_ALIASES = (
+    ("bug", {"bug", "bugs", "bugfix", "fix", "hotfix", "defect", "error", "regression", "incident", "perbaikan"}),
+    ("feature", {"feature", "features", "feat", "story", "fitur"}),
+    ("enhancement", {"enhancement", "enhance", "improvement", "improve", "optimization", "optimize", "performance", "tweak", "peningkatan"}),
+    ("refactor", {"refactor", "refactoring", "cleanup", "debt"}),
+    ("research", {"research", "spike", "investigation", "investigate", "poc", "riset"}),
+    ("docs", {"docs", "doc", "documentation", "dokumentasi"}),
+    ("chore", {"chore", "maintenance", "infra", "devops", "config", "deps", "dependencies", "upgrade"}),
+)
+TITLE_LABEL = re.compile(r"^\s*(?:\[([^\]]+)\]|([A-Za-z][\w-]*)(?:\([^)]*\))?!?\s*:)")
+
 
 class InvalidReference(ValueError):
     """Raised when an input cannot be turned into a ClickUp task reference."""
@@ -235,6 +248,36 @@ def nested_name(value: Any, key: str = "status") -> Optional[str]:
     return value
 
 
+def match_work_type(label: str) -> Optional[str]:
+    words = set(re.split(r"[^0-9a-z]+", label.lower()))
+    for work_type, aliases in WORK_TYPE_ALIASES:
+        if words & aliases:
+            return work_type
+    return None
+
+
+def classify_work_type(tags: List[str], name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Guess the kind of work (bug, feature, ...) from the tags, then from a title prefix.
+
+    Returns (work_type, source), or (None, None) when nothing matches.
+    """
+    matches = {}
+    for tag in tags:
+        work_type = match_work_type(tag)
+        if work_type and work_type not in matches:
+            matches[work_type] = tag
+    for work_type, _ in WORK_TYPE_ALIASES:
+        if work_type in matches:
+            return work_type, f"tag: {matches[work_type]}"
+
+    label = TITLE_LABEL.match(name or "")
+    if label:
+        work_type = match_work_type(label.group(1) or label.group(2))
+        if work_type:
+            return work_type, "title prefix"
+    return None, None
+
+
 def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) -> Dict[str, Any]:
     """Reduce the raw API payload to the fields that matter when reading a card."""
     task = result["task"]
@@ -252,6 +295,9 @@ def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) ->
     if max_comments >= 0:
         comments = comments[-max_comments:] if max_comments else []
 
+    tags = [tag.get("name") for tag in task.get("tags") or [] if tag.get("name")]
+    work_type, work_type_source = classify_work_type(tags, task.get("name"))
+
     return {
         "id": task.get("id"),
         "custom_id": task.get("custom_id"),
@@ -261,7 +307,9 @@ def simplify(result: Dict[str, Any], tz: Optional[tzinfo], max_comments: int) ->
         "priority": nested_name(task.get("priority"), "priority"),
         "assignees": [user_name(user) for user in task.get("assignees") or []],
         "creator": user_name(task.get("creator")) if task.get("creator") else None,
-        "tags": [tag.get("name") for tag in task.get("tags") or [] if tag.get("name")],
+        "tags": tags,
+        "work_type": work_type,
+        "work_type_source": work_type_source,
         "location": " › ".join(location) or None,
         "start_date": format_timestamp(task.get("start_date"), tz),
         "due_date": format_timestamp(task.get("due_date"), tz),
@@ -312,6 +360,7 @@ def format_markdown(card: Dict[str, Any]) -> str:
         ("Creator", card.get("creator")),
         ("Location", card.get("location")),
         ("Tags", ", ".join(card["tags"]) or None),
+        ("Type", f"{card['work_type']} ({card['work_type_source']})" if card.get("work_type") else None),
         ("Start", card.get("start_date")),
         ("Due", card.get("due_date")),
         ("Created", card.get("created")),

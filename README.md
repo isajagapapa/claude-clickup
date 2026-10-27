@@ -2,7 +2,7 @@
 
 **English** · [Bahasa Indonesia](README.id.md)
 
-A [Claude Code](https://claude.com/claude-code) skill that reads ClickUp tasks from their links. Paste one or many card links and Claude fetches the details through the ClickUp API, summarizes them, and can turn them into a plan or code changes in whatever project you are working on.
+[Claude Code](https://claude.com/claude-code) skills that read ClickUp tasks from their links. Paste one or many card links and Claude fetches the details through the ClickUp API, summarizes them, and plans the work per card type (bug, feature, enhancement, ...) in whatever project you are working on.
 
 ClickUp links need a login, so Claude cannot open them by fetching the page. This skill uses your personal API token instead.
 
@@ -12,6 +12,8 @@ ClickUp links need a login, so Claude cannot open them by fetching the page. Thi
 - Title, status, priority, assignees, start/due dates, tags, folder and list
 - Description (Markdown), checklists, subtasks, attachment names, latest comments
 - Normal task IDs and custom task IDs (`PROJ-123`)
+- Detects the card type from its tags or title prefix (bug, feature, enhancement, refactor, research, docs, chore)
+- `plan` skill: a work plan per card shaped by its type; in plan mode it only plans, otherwise it plans and executes
 - Read-only: never changes anything in ClickUp
 - Python standard library only, no packages to install
 
@@ -72,11 +74,22 @@ Update later with `/plugin marketplace update claude-clickup`.
 git clone https://github.com/isajagapapa/claude-clickup.git
 mkdir -p ~/.claude/skills
 cp -R claude-clickup/skills/clickup ~/.claude/skills/clickup
+cp -R claude-clickup/skills/plan ~/.claude/skills/clickup-plan
+sed -i.bak 's/^name: plan$/name: clickup-plan/' ~/.claude/skills/clickup-plan/SKILL.md && rm ~/.claude/skills/clickup-plan/SKILL.md.bak
 ```
 
-To use it in a single project only, copy it to `<project>/.claude/skills/clickup` instead.
+The `plan` skill is copied as `clickup-plan` because Claude Code already has a built-in `/plan` command. Keep both folders side by side: `clickup-plan` runs the fetcher inside `clickup`.
 
-## Usage
+To use them in a single project only, copy them to `<project>/.claude/skills/` instead.
+
+## Skills
+
+| Skill | Plugin command | Manual install | What it does |
+|---|---|---|---|
+| `clickup` | `/clickup:clickup <links>` | `/clickup <links>` | Reads cards and summarizes them |
+| `plan` | `/clickup:plan <links>` | `/clickup-plan <links>` | Plans the work per card type, then executes it outside plan mode |
+
+### `clickup`: read cards
 
 Invoke the skill and pass the links:
 
@@ -96,12 +109,54 @@ https://app.clickup.com/t/9012345678/PROJ-42
 You can also just paste links in a normal message, and Claude picks the skill up on its own:
 
 ```
-Read these cards and make an implementation plan:
+What do these cards ask for?
 https://app.clickup.com/t/86abc123
 https://app.clickup.com/t/86def456
 ```
 
-Claude replies with a summary per card (goal, acceptance criteria, decisions from comments, open questions), plus an overview table when there are several cards.
+Claude replies with a summary per card (goal, acceptance criteria, decisions from comments, open questions), plus an overview table (card, type, status, assignee, due date) when there are several cards.
+
+### `plan`: plan the work
+
+```
+/clickup:plan https://app.clickup.com/t/86abc123 https://app.clickup.com/t/86def456
+```
+
+Asking in a normal message ("plan these cards", "fix this card") also triggers it. For each card Claude:
+
+1. reads the card and picks its type from the tags (falling back to a title prefix such as `[Bug]` or `fix:`, then to its own judgement, which it states),
+2. explores your project so the plan names real files and tests,
+3. writes a plan from the template for that type, plus open questions for the card owner,
+4. shows it in the chat, and also saves it where your project's CLAUDE.md says plans go (if it says so).
+
+What happens next depends on the Claude Code mode:
+
+| Mode | Behaviour |
+|---|---|
+| Plan mode (Shift+Tab) | Only plans. Claude stops at plan approval and waits for your instruction. |
+| Any other mode | Plans, warns you with "⚡ Not in plan mode: executing this plan now", then executes right away. Press Esc to stop. |
+
+Working rules for every card:
+
+- **Senior developer review**: architecture, edge cases, error handling, security, performance and maintainability are checked before the plan is final. A weak solution in the card gets a better proposal.
+- **Best practice for your stack**: the language, framework and versions are read from your project (`composer.json`, `package.json`, `pyproject.toml`, ...), and their idioms, linters and test patterns are followed. Your project's own conventions win.
+- **Clear scope**: every plan says what is in scope and what is out of scope, and execution stays inside it.
+- **Recommendations**: findings outside the scope that affect it (other bugs, tech debt, security risks) are listed with their impact and a suggestion, never changed without your approval.
+- **Self-fixing**: while executing, tests and linters run after each step. Failures and bugs inside the scope are fixed until green (never by weakening tests); after 3 failed attempts Claude stops and reports.
+
+Card types and the tags that map to them (matched per word, case-insensitive; with several matching tags the first row wins):
+
+| Type | Tags | Plan focuses on |
+|---|---|---|
+| `bug` | bug, bugfix, fix, hotfix, defect, error, regression, incident, perbaikan | reproduce, root cause, failing test first, minimal fix, rollback |
+| `feature` | feature, feat, story, fitur | scope and acceptance criteria, design, increments, rollout |
+| `enhancement` | enhancement, enhance, improvement, improve, optimization, performance, tweak, peningkatan | current vs desired, compatibility, how to measure |
+| `refactor` | refactor, cleanup, tech-debt | unchanged behaviour, safety-net tests, small green steps |
+| `research` | research, spike, investigation, poc, riset | question, options, timebox, recommendation |
+| `docs` | docs, documentation, dokumentasi | reader, files, accuracy of samples |
+| `chore` | chore, maintenance, infra, devops, config, deps, upgrade | change, impact, rollback |
+
+The templates live in [`skills/plan/references/`](skills/plan/references/).
 
 ### Supported links
 
@@ -152,7 +207,7 @@ Exit codes: `0` all loaded, `1` some failed, `2` bad usage, `3` token missing.
 ## Uninstall
 
 - Plugin: `/plugin uninstall clickup@claude-clickup`, then `/plugin marketplace remove claude-clickup`
-- Manual: `rm -rf ~/.claude/skills/clickup`
+- Manual: `rm -rf ~/.claude/skills/clickup ~/.claude/skills/clickup-plan`
 
 ## Contributing
 

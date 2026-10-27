@@ -1,6 +1,6 @@
 ---
 name: clickup
-description: Read ClickUp tasks (cards) from their links. Use whenever the user shares one or more ClickUp task links (app.clickup.com/t/...) or task IDs, or asks to read, summarize, plan or implement a ClickUp card. Fetches title, status, assignees, dates, description, checklists, subtasks, attachments and comments through the ClickUp API. Never use WebFetch on ClickUp links, they only return a login page.
+description: Read ClickUp tasks (cards) from their links. Use whenever the user shares one or more ClickUp task links (app.clickup.com/t/...) or task IDs, or asks to read or summarize a ClickUp card. To plan or implement a card, use the `plan` skill of this plugin instead. Fetches title, status, assignees, dates, description, checklists, subtasks, attachments and comments through the ClickUp API. Never use WebFetch on ClickUp links, they only return a login page.
 argument-hint: <clickup-link> [<clickup-link> ...]
 ---
 
@@ -45,9 +45,9 @@ Reply in the user's language. For each card:
 - **Decisions and context**: anything from the comments that changes the scope.
 - **Open questions**: gaps or contradictions worth asking the card owner about.
 
-With more than one card, start with a table: card, status, assignee, due date.
+With more than one card, start with a table: card, type, status, assignee, due date. The type comes from the card's `Type` line (from its tags or title prefix); leave it empty when there is none.
 
-If the user asks to plan or implement a card, follow the current project's conventions (its CLAUDE.md, plan folders, test rules) rather than a fixed format.
+If the user asks to plan or implement a card, use the `plan` skill (`/clickup:plan <links>`), which builds a plan per card type and follows the project's conventions.
 
 ## Rules
 
