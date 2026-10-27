@@ -1,0 +1,13 @@
+{
+  "name": "clickup",
+  "version": "0.1.0",
+  "description": "Read ClickUp tasks from their links: paste one or many card links and Claude fetches title, status, description, checklists, subtasks and comments through the ClickUp API.",
+  "author": {
+    "name": "Faisal Fidiyatulloh",
+    "url": "https://github.com/isajagapapa"
+  },
+  "homepage": "https://github.com/isajagapapa/claude-clickup",
+  "repository": "https://github.com/isajagapapa/claude-clickup",
+  "license": "MIT",
+  "keywords": ["clickup", "project-management", "tasks", "skill"]
+}
